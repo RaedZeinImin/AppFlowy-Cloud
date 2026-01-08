@@ -62,6 +62,7 @@ use collab_rt_entity::user::RealtimeUser;
 use collab_rt_entity::RealtimeMessage;
 use collab_rt_protocol::collab_from_encode_collab;
 use database::user::select_uid_from_email;
+use database::workspace::select_user_profile;
 use database_entity::dto::PublishCollabItem;
 use database_entity::dto::PublishInfo;
 use database_entity::dto::*;
@@ -149,6 +150,10 @@ pub fn workspace_scope() -> Scope {
     .service(
       web::resource("/{workspace_id}/update-member-profile")
         .route(web::put().to(put_workspace_member_profile_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/workspace-profile")
+        .route(web::get().to(get_workspace_member_profile_handler)),
     )
     // Deprecated since v0.9.24
     .service(
@@ -402,6 +407,10 @@ pub fn workspace_scope() -> Scope {
     .service(
       web::resource("/{workspace_id}/database/{database_id}/row/detail")
         .route(web::get().to(list_database_row_details_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/database/{database_id}/blob/diff")
+        .route(web::post().to(database_blob_diff_handler)),
     )
     .service(
       web::resource("/{workspace_id}/quick-note")
@@ -832,6 +841,34 @@ async fn put_workspace_member_profile_handler(
   let updated_profile = payload.into_inner();
   update_workspace_member_profile(&state.pg_pool, &workspace_id, uid, &updated_profile).await?;
   Ok(AppResponse::Ok().into())
+}
+
+/// GET /api/workspace/{workspace_id}/workspace-profile
+/// Returns the current user's workspace member profile
+async fn get_workspace_member_profile_handler(
+  user_uuid: UserUuid,
+  path: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> Result<JsonAppResponse<MentionablePerson>> {
+  let workspace_id = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .workspace_access_control
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
+    .await?;
+  
+  // Get the user's UUID
+  let user = select_user_profile(&state.pg_pool, &user_uuid).await?
+    .ok_or_else(|| AppError::RecordNotFound(format!("User profile not found")))?;
+  let person_uuid = user.uuid
+    .ok_or_else(|| AppError::RecordNotFound(format!("User UUID not found")))?;
+  
+  // Get the mentionable person profile
+  let person =
+    workspace::ops::get_workspace_mentionable_person(&state.pg_pool, &workspace_id, &person_uuid)
+      .await?;
+  
+  Ok(AppResponse::Ok().with_data(person).into())
 }
 
 #[instrument(skip_all, err)]
@@ -2749,6 +2786,49 @@ async fn list_database_row_details_handler(
   )
   .await?;
   Ok(Json(AppResponse::Ok().with_data(db_rows)))
+}
+
+/// Stub endpoint for database blob diff
+/// Returns an empty diff response since this open-source version doesn't support blob storage
+/// This prevents 404 errors and retry loops on the frontend
+async fn database_blob_diff_handler(
+  user_uuid: UserUuid,
+  path_param: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+  _payload: Payload,
+) -> Result<HttpResponse> {
+  let (workspace_id, _database_id) = path_param.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  
+  // Verify user has access to the workspace
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
+  
+  // Create a minimal protobuf DatabaseBlobDiffResponse
+  // Based on the proto definition in AppFlowy-Web:
+  // message DatabaseBlobDiffResponse {
+  //   string manifest_version = 1;
+  //   repeated DatabaseBlobRowUpdate updates = 3;
+  //   repeated DatabaseBlobRowDelete deletes = 4;
+  //   repeated DatabaseBlobRowUpdate creates = 5;
+  //   DiffStatus status = 6;  // 0 = READY
+  // }
+  
+  // Manually encode a minimal valid protobuf response:
+  // Field 1 (manifest_version): tag=0x0A (field 1, wire type 2=length-delimited), length=1, value="1"
+  // Field 6 (status): tag=0x30 (field 6, wire type 0=varint), value=0 (READY)
+  let response_bytes: Vec<u8> = vec![
+    0x0A, 0x01, 0x31, // Field 1: manifest_version = "1"
+    0x30, 0x00,       // Field 6: status = 0 (READY)
+  ];
+  
+  Ok(
+    HttpResponse::Ok()
+      .content_type("application/octet-stream")
+      .body(response_bytes),
+  )
 }
 
 #[inline]
